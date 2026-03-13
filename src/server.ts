@@ -4,6 +4,7 @@ import dotenv from "dotenv"
 import { createLogger, format, transports } from "winston"
 import DailyRotateFile from "winston-daily-rotate-file"
 import type { TranslationRequest, TranslationResponse, ApiError } from "./interfaces/translation.interface"
+import { getStatsData, recordSuccess, recordFailure } from "./controllers/translate.save"
 import path from "path"
 
 // Configuração de ambiente
@@ -80,27 +81,36 @@ app.get("/health", (req: Request, res: Response) => {
 })
 
 // Rota para estatísticas da API
-app.get("/api/v1/stats", (req: Request, res: Response) => {
-  const stats = {
-    totalRequests: 0,
-    successfulTranslations: 0,
-    failedTranslations: 0,
-    averageResponseTime: 0, // ms
-    topSourceLanguages: [
-      { code: "en", count: 500 },
-      { code: "pt", count: 300 },
-      { code: "es", count: 200 },
-    ],
-    topTargetLanguages: [
-      { code: "pt", count: 600 },
-      { code: "en", count: 400 },
-      { code: "fr", count: 150 },
-    ],
-    lastUpdated: new Date().toISOString(),
-  }
+app.get("/api/v1/stats", async (req: Request, res: Response) => {
+  try {
+    const stored = await getStatsData();
+    const sortLangs = (langs: Record<string, number>) => {
+      return Object.entries(langs)
+        .map(([code, count]) => ({ code, count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 5);
+    };
 
-  res.status(200).json(stats)
-})
+    const avgTime = stored.successfulTranslations > 0 
+      ? stored.totalResponseTime / stored.successfulTranslations 
+      : 0;
+
+    const statsResponse = {
+      totalRequests: stored.totalRequests,
+      successfulTranslations: stored.successfulTranslations,
+      failedTranslations: stored.failedTranslations,
+      averageResponseTime: Number(avgTime.toFixed(2)),
+      topSourceLanguages: sortLangs(stored.sourceLanguages),
+      topTargetLanguages: sortLangs(stored.targetLanguages),
+      lastUpdated: stored.lastUpdated,
+    };
+
+    res.status(200).json(statsResponse);
+  } catch (error) {
+    logger.error("Error fetching stats", error);
+    res.status(500).json({ error: "Failed to fetch statistics" });
+  }
+});
 
 // Rota principal de tradução
 app.post("/api/v1/translate", async (req: Request, res: Response) => {
@@ -136,31 +146,60 @@ app.post("/api/v1/translate", async (req: Request, res: Response) => {
     })
 
     const { translate } = await import("@vitalets/google-translate-api")
+    
     const result = await translate(text, {
       to: targetLang,
-      from: sourceLang,
+      from: sourceLang, // Se for undefined, é Auto-Detect
     })
+
+    let detectedLanguage = "unknown"
+    if (result.raw) {
+      const rawResponse = result.raw as any
+      if (
+        rawResponse.ld_result && 
+        rawResponse.ld_result.srclangs && 
+        rawResponse.ld_result.srclangs.length > 0
+      ) {
+        detectedLanguage = rawResponse.ld_result.srclangs[0]
+      } 
+      else if (rawResponse.src) {
+        detectedLanguage = rawResponse.src
+      } 
+      else if (rawResponse.detectedLanguage) {
+        detectedLanguage = rawResponse.detectedLanguage
+      }
+    }
+    
+    if (detectedLanguage === "unknown" && result.raw) {
+      const rawResponse = result.raw as any
+      if (rawResponse.ld_result?.srclangs?.[0]) {
+        detectedLanguage = rawResponse.ld_result.srclangs[0]
+      }
+    }
+
+    let finalTranslatedText = result.text;
+    const isTextUnchanged = finalTranslatedText.trim().toLowerCase() === text.trim().toLowerCase();
+    const isLanguageDifferent = detectedLanguage !== "unknown" && detectedLanguage !== targetLang;
+
+    if (isTextUnchanged && isLanguageDifferent) {
+        logger.info(`Re-translating triggered. Detected: ${detectedLanguage}, Target: ${targetLang}`);
+        
+        const retryResult = await translate(text, {
+            to: targetLang,
+            from: detectedLanguage
+        });
+        
+        finalTranslatedText = retryResult.text;
+    }
 
     const [seconds, nanoseconds] = process.hrtime(startTime)
     const responseTime = seconds * 1000 + nanoseconds / 1e6
 
-    console.log('Translation result structure:', JSON.stringify(result, null, 2));
-
-  
-    let detectedLanguage = "unknown";
-    if (result.raw) {
-
-      const rawResponse = result.raw as any;
-      if (rawResponse.src) {
-        detectedLanguage = rawResponse.src;
-      } else if (rawResponse.detectedLanguage) {
-        detectedLanguage = rawResponse.detectedLanguage;
-      }
-    }
+    void recordSuccess(responseTime, detectedLanguage, targetLang); 
 
     const response: TranslationResponse = {
       originalText: text,
-      translatedText: result.text,
+      translatedText: finalTranslatedText,
       detectedLanguage: detectedLanguage,
       targetLanguage: targetLang,
       translationTime: responseTime,
@@ -171,10 +210,14 @@ app.post("/api/v1/translate", async (req: Request, res: Response) => {
       responseTime: `${responseTime.toFixed(2)}ms`,
       detectedLanguage: response.detectedLanguage,
       targetLanguage: response.targetLanguage,
+      resultPreview: finalTranslatedText.substring(0, 20)
     })
 
     res.status(200).json(response)
+
   } catch (error: unknown) {
+    void recordFailure();
+
     const errorMessage = error instanceof Error ? error.message : "Unknown error"
     const errorStack = error instanceof Error ? error.stack : undefined
 
@@ -193,7 +236,6 @@ app.post("/api/v1/translate", async (req: Request, res: Response) => {
     res.status(500).json(apiError)
   }
 })
-
 app.use((req: Request, res: Response) => {
   const error: ApiError = {
     error: "Endpoint not found",
